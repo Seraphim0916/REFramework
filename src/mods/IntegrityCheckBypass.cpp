@@ -14,6 +14,17 @@
 
 #include "IntegrityCheckBypass.hpp"
 
+// Wine/CrossOver/Proton detection
+static bool is_wine() {
+    static int cached = -1;
+    if (cached == -1) {
+        auto ntdll = GetModuleHandleA("ntdll.dll");
+        cached = (ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr) ? 1 : 0;
+        if (cached) spdlog::info("[IntegrityCheckBypass]: Wine/CrossOver/Proton environment detected");
+    }
+    return cached == 1;
+}
+
 template <typename T>
 T get_register_value(safetyhook::Context& context, int reg);
 
@@ -1832,10 +1843,28 @@ void IntegrityCheckBypass::remove_stack_destroyer() {
     spdlog::info("[IntegrityCheckBypass]: Searching for stack destroyer...");
 
     const auto game = utility::get_executable();
-    const auto fn = utility::scan(game, "48 89 11 48 c7 04 24 00 00 00 00 48 81 c4 28 01 00 00");
+    auto fn = utility::scan(game, "48 89 11 48 c7 04 24 00 00 00 00 48 81 c4 28 01 00 00");
 
     if (!fn) {
         spdlog::error("[IntegrityCheckBypass]: Could not find stack destroyer!");
+
+        if (is_wine()) {
+            spdlog::info("[IntegrityCheckBypass]: Wine fallback: hooking RtlCaptureStackBackTrace");
+            auto ntdll = GetModuleHandleA("ntdll.dll");
+            auto rtl_fn = ntdll ? (void*)GetProcAddress(ntdll, "RtlCaptureStackBackTrace") : nullptr;
+            if (rtl_fn) {
+                static safetyhook::InlineHook rtl_hook;
+                rtl_hook = safetyhook::create_inline(rtl_fn,
+                    +[](ULONG Skip, ULONG Capture, PVOID* Trace, PULONG Hash) -> USHORT {
+                        if (Capture < 32) {
+                            return rtl_hook.call<USHORT>(Skip, Capture, Trace, Hash);
+                        }
+                        if (Hash) *Hash = 0;
+                        return 0;
+                    });
+                spdlog::info("[IntegrityCheckBypass]: Hooked RtlCaptureStackBackTrace (Wine fallback)");
+            }
+        }
         return;
     }
 
@@ -1848,6 +1877,18 @@ void IntegrityCheckBypass::remove_stack_destroyer() {
 void IntegrityCheckBypass::setup_pristine_syscall() {
     if (s_pristine_protect_virtual_memory != nullptr) {
         spdlog::info("[IntegrityCheckBypass]: NtProtectVirtualMemory already setup!");
+        return;
+    }
+
+
+    // Wine: ntdll NtProtectVirtualMemory is a C wrapper, not raw syscall.
+    // Copying bytes to new allocation produces broken code.
+    if (is_wine()) {
+        spdlog::info("[IntegrityCheckBypass]: Wine detected, skipping pristine NtProtectVirtualMemory copy");
+        auto ntdll_base = GetModuleHandleA("ntdll.dll");
+        auto fn = (NtProtectVirtualMemory_t)GetProcAddress(ntdll_base, "NtProtectVirtualMemory");
+        s_og_protect_virtual_memory = fn;
+        s_pristine_protect_virtual_memory = fn;
         return;
     }
 
@@ -1911,6 +1952,14 @@ void IntegrityCheckBypass::fix_virtual_protect() try {
 
 BOOL WINAPI IntegrityCheckBypass::virtual_protect_impl(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
     static const auto this_process = GetCurrentProcess();
+
+    // Wine: fall back to original VirtualProtect (Wine implements it correctly)
+    if (is_wine()) {
+        if (s_virtual_protect_hook) {
+            return s_virtual_protect_hook->get_original<decltype(virtual_protect_hook)>()(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+        }
+        return VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+    }
 
     LPVOID address_to_protect = lpAddress;
     NTSTATUS result = s_og_protect_virtual_memory(this_process, (PVOID*)&address_to_protect, &dwSize, flNewProtect, lpflOldProtect);
